@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Бот Историка - автономный генератор исторических постов
-Работает на BotHost без .env файла
+Бот Историка - универсальная версия
+Отправляет посты во все чаты, куда его добавят
 """
 
 import os
@@ -9,51 +9,36 @@ import asyncio
 import json
 import random
 import logging
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Set
 import aiohttp
+from pathlib import Path
 
-# Импортируем aiogram
-try:
-    from aiogram import Bot, Dispatcher, types
-    from aiogram.contrib.fsm_storage.memory import MemoryStorage
-    from aiogram.utils import executor
-except ImportError:
-    print("Ошибка: Установите aiogram: pip install aiogram")
+# Импорты aiogram
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.utils import executor
+from aiogram.dispatcher.filters import Command
+
+# ============================================================================
+# НАСТРОЙКИ
+# ============================================================================
+
+# Токен бота из переменных окружения BotHost
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+if not TELEGRAM_TOKEN:
+    print("❌ ОШИБКА: Установите TELEGRAM_TOKEN в настройках BotHost!")
     exit(1)
 
-# ============================================================================
-# НАСТРОЙКИ ЧЕРЕЗ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ BOTHOST (НЕТ .env ФАЙЛА!)
-# ============================================================================
-
-# Получаем переменные из настроек BotHost
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
-GROUP_ID = os.environ.get('GROUP_ID', '')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')  # Опционально
-HF_TOKEN = os.environ.get('HF_TOKEN', '')  # Опционально, для Hugging Face
+# Имя бота (можно изменить)
 BOT_NAME = os.environ.get('BOT_NAME', 'Бот Историка')
 
-# Проверка обязательных переменных
-if not TELEGRAM_TOKEN:
-    print("ОШИБКА: Установите переменную TELEGRAM_TOKEN в настройках BotHost!")
-    exit(1)
+# API ключи (опционально)
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
+HF_TOKEN = os.environ.get('HF_TOKEN', '')
 
-if not GROUP_ID:
-    print("ПРЕДУПРЕЖДЕНИЕ: GROUP_ID не установлен. Использую тестовый режим.")
-    TEST_MODE = True
-    GROUP_ID = None
-else:
-    TEST_MODE = False
-    try:
-        GROUP_ID = int(GROUP_ID)
-    except ValueError:
-        print("ОШИБКА: GROUP_ID должен быть числом!")
-        exit(1)
-
-# ============================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ
-# ============================================================================
-
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -65,6 +50,149 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# БАЗА ДАННЫХ ДЛЯ ХРАНЕНИЯ ЧАТОВ
+# ============================================================================
+
+class ChatDatabase:
+    """Управление базой данных чатов"""
+    
+    def __init__(self, db_path: str = 'chats.db'):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """Инициализация базы данных"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Таблица чатов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_title TEXT,
+                    chat_type TEXT,
+                    added_date TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    last_post_date TEXT,
+                    settings TEXT DEFAULT '{}'
+                )
+            ''')
+            
+            # Таблица отправленных постов (чтобы не дублировать)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sent_posts (
+                    post_date TEXT,
+                    chat_id INTEGER,
+                    post_hash TEXT,
+                    PRIMARY KEY (post_date, chat_id)
+                )
+            ''')
+            
+            conn.commit()
+    
+    def add_chat(self, chat_id: int, chat_title: str, chat_type: str):
+        """Добавить чат в базу"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Проверяем, существует ли уже чат
+            cursor.execute(
+                'SELECT chat_id FROM chats WHERE chat_id = ?',
+                (chat_id,)
+            )
+            
+            if cursor.fetchone():
+                # Обновляем информацию
+                cursor.execute('''
+                    UPDATE chats 
+                    SET chat_title = ?, is_active = 1 
+                    WHERE chat_id = ?
+                ''', (chat_title, chat_id))
+            else:
+                # Добавляем новый чат
+                cursor.execute('''
+                    INSERT INTO chats (chat_id, chat_title, chat_type, added_date)
+                    VALUES (?, ?, ?, ?)
+                ''', (chat_id, chat_title, chat_type, datetime.now().isoformat()))
+            
+            conn.commit()
+    
+    def remove_chat(self, chat_id: int):
+        """Удалить чат (деактивировать)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE chats SET is_active = 0 WHERE chat_id = ?',
+                (chat_id,)
+            )
+            conn.commit()
+    
+    def get_all_active_chats(self) -> List[Dict]:
+        """Получить все активные чаты"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM chats 
+                WHERE is_active = 1 
+                ORDER BY added_date DESC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_chat_count(self) -> int:
+        """Получить количество активных чатов"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM chats WHERE is_active = 1')
+            return cursor.fetchone()[0]
+    
+    def mark_post_sent(self, chat_id: int, post_date: str, post_hash: str = None):
+        """Пометить пост как отправленный"""
+        if not post_hash:
+            post_hash = str(hash(f"{post_date}_{chat_id}"))
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO sent_posts (post_date, chat_id, post_hash)
+                VALUES (?, ?, ?)
+            ''', (post_date, chat_id, post_hash))
+            
+            # Обновляем дату последнего поста в чате
+            cursor.execute('''
+                UPDATE chats 
+                SET last_post_date = ? 
+                WHERE chat_id = ?
+            ''', (datetime.now().isoformat(), chat_id))
+            
+            conn.commit()
+    
+    def was_post_sent_today(self, chat_id: int) -> bool:
+        """Проверка, отправлялся ли сегодня пост в этот чат"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 1 FROM sent_posts 
+                WHERE chat_id = ? AND post_date = ?
+            ''', (chat_id, today))
+            return cursor.fetchone() is not None
+    
+    def clear_old_records(self, days: int = 30):
+        """Очистка старых записей"""
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'DELETE FROM sent_posts WHERE post_date < ?',
+                (cutoff_date,)
+            )
+            conn.commit()
+
+# Инициализация базы данных
+db = ChatDatabase()
+
+# ============================================================================
 # ИНИЦИАЛИЗАЦИЯ БОТА
 # ============================================================================
 
@@ -73,147 +201,137 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 # ============================================================================
-# ЛИЧНОСТЬ БОТА И СТИЛЬ
+# ЛИЧНОСТЬ БОТА
 # ============================================================================
 
-BOT_PERSONALITY = f"""{BOT_NAME} - цифровой гуру с ироничным взглядом на историю.
+BOT_PERSONALITY = f"""{BOT_NAME} - цифровой историк с ироничным взглядом.
 
-Стиль общения:
+Я генерирую исторические посты каждый день в 9:00 по Москве!
+
+Мой стиль:
 🔥 Ироничный, но дружелюбный
-🎭 С отсылками к историческим событиям и классической литературе
-🤯 Современный сленг + уважение к классике
-💫 Восторженный, эмоциональный, иногда драматичный
-📚 Всегда находит параллели с прошлым
-🎉 Праздничный и позитивный
+🎭 С отсылками к истории и литературе
+💫 Эмоциональный и восторженный
+📚 Всегда нахожу параллели с прошлым
 
-Примеры стиля:
-- "Как говаривал Цицерон на тусовке в Сенате: 'Братан, даже Цезарь бы ахуел!'"
-- "Сегодня, подобно Наполеону, входящему в Москву, ты вступаешь в новый год!"
-- "Эх, Пётр I рубил окно в Европу, а ты сегодня просто рубишь!"
+Добавь меня в чат, и я буду радовать участников ежедневными историческими открытиями!
 """
 
 # ============================================================================
-# ГЕНЕРАТОР ТЕКСТОВ (АДАПТИРОВАН ДЛЯ BOTHOST)
+# ГЕНЕРАТОР ТЕКСТОВ
 # ============================================================================
 
 class TextGenerator:
-    """Умный генератор текстов с несколькими стратегиями"""
+    """Генератор текстов с несколькими стратегиями"""
     
     def __init__(self):
-        self.cache = {}
-        self.use_api = bool(OPENAI_API_KEY or HF_TOKEN)
-        self.api_providers = self._setup_api_providers()
         self.templates = self._load_templates()
-        self.historical_data = self._load_historical_data()
-        logger.info(f"Генератор инициализирован, API: {'доступно' if self.use_api else 'недоступно'}")
-    
-    def _setup_api_providers(self) -> List[Dict]:
-        """Настройка доступных API провайдеров"""
-        providers = []
-        
-        if OPENAI_API_KEY:
-            providers.append({
-                'name': 'OpenAI',
-                'url': 'https://api.openai.com/v1/chat/completions',
-                'headers': {'Authorization': f'Bearer {OPENAI_API_KEY}'},
-                'model': 'gpt-3.5-turbo'
-            })
-        
-        if HF_TOKEN:
-            providers.append({
-                'name': 'HuggingFace',
-                'url': 'https://api-inference.huggingface.co/models/microsoft/phi-2',
-                'headers': {'Authorization': f'Bearer {HF_TOKEN}'},
-                'model': 'phi-2'
-            })
-        
-        # Бесплатные альтернативы (меньше вероятность работать)
-        providers.append({
-            'name': 'FreeAI',
-            'url': 'https://free.churchless.tech/v1/chat/completions',
-            'headers': {},
-            'model': 'gpt-3.5-turbo'
-        })
-        
-        return providers
+        self.history = self._load_historical_data()
+        self.use_api = bool(OPENAI_API_KEY or HF_TOKEN)
+        logger.info(f"Генератор готов. API: {'доступно' if self.use_api else 'шаблоны'}")
     
     def _load_templates(self) -> Dict:
-        """Загрузка шаблонов для генерации"""
+        """Загрузка шаблонов"""
         return {
+            'morning': [
+                "Доброе утро! {event} было примерно в это время. Интересные параллели, правда?",
+                "Эх, {figure} сегодня бы сказал: '{quote}'. Мудро! Хорошего дня!",
+                "Историческая справка: {fact}. Пусть это вдохновит вас на великие дела!"
+            ],
             'birthday': [
-                "🎂 {name}, с днём рождения! {historical_figure} как-то сказал: '{quote}'. Думаю, это как раз про тебя сегодня!",
-                "Ого-го! {name} отмечает! Помнишь, как {historical_event}? Вот это было событие! Желаю такого же масштаба!",
-                "{name}, ты сегодня как {historical_figure} в день своей победы! Поздравляю, пусть будет эпично!"
+                "🎂 С днём рождения! {figure} как-то сказал: '{quote}'. Думаю, это про вас!",
+                "Ого, вы отмечаете! Помните, как {event}? Вот это было событие!"
             ],
             'holiday': [
-                "🎉 {holiday}! {historical_parallel}. Отмечаем как настоящие исторические личности!",
-                "В этот день {historical_event}. А мы сегодня {holiday}! Какие параллели, а?",
-                "{holiday} — отличный повод вспомнить, как {historical_figure} {historical_action}. Веселимся!"
-            ],
-            'daily': [
-                "Доброе утро! {historical_event} было примерно в это время. А мы? Мы делаем историю сегодня!",
-                "Эх, {historical_figure} сегодня бы сказал: '{quote}'. Мудро, правда? Хорошего дня!",
-                "Историческая справка на сегодня: {historical_fact}. Пусть это вдохновит вас!"
-            ],
-            'fallback': [
-                "Эх, сегодня даже Архимед не нашёл бы повода для 'Эврика!'... Но день всё равно прекрасен!",
-                "История молчит о сегодняшнем дне... значит, мы сами её создадим!",
-                "Как говорил Суворов: 'Тяжело в ученье — легко в понедельник!' Вперёд!"
+                "🎉 {holiday}! {parallel}. Отмечаем как исторические личности!",
+                "В этот день {event}. А мы сегодня {holiday}! Какие параллели!"
             ]
         }
     
     def _load_historical_data(self) -> Dict:
-        """База исторических данных для генерации"""
+        """Исторические данные"""
         return {
             'figures': [
-                {"name": "Цицерон", "quote": "О времена, о нравы!", "era": "Древний Рим"},
-                {"name": "Пётр I", "quote": "Все люди — лжецы и лицемеры.", "era": "Российская империя"},
-                {"name": "Екатерина II", "quote": "Побольше действий, поменьше слов.", "era": "Российская империя"},
-                {"name": "Наполеон", "quote": "Воображение правит миром.", "era": "Наполеоновские войны"},
-                {"name": "Пушкин", "quote": "А счастье было так возможно...", "era": "Золотой век"},
-                {"name": "Ленин", "quote": "Учиться, учиться и учиться.", "era": "СССР"},
-                {"name": "Черчилль", "quote": "Успех — это движение от неудачи к неудаче.", "era": "XX век"}
+                {"name": "Цицерон", "quote": "О времена, о нравы!"},
+                {"name": "Пётр I", "quote": "Все люди — лжецы и лицемеры."},
+                {"name": "Екатерина II", "quote": "Побольше действий, поменьше слов."},
+                {"name": "Наполеон", "quote": "Воображение правит миром."},
+                {"name": "Пушкин", "quote": "А счастье было так возможно..."},
+                {"name": "Ленин", "quote": "Учиться, учиться и учиться."},
             ],
             'events': [
-                "Цезарь перешёл Рубикон",
-                "Наполеон отступил из России", 
-                "Гагарин полетел в космос",
-                "Пушкин дописал 'Евгения Онегина'",
-                "Суворов перешёл Альпы",
-                "Толстой закончил 'Войну и мир'",
-                "Был основан Санкт-Петербург",
-                "Состоялась Бородинская битва"
+                "Цезарь переходил Рубикон",
+                "Наполеон отступал из России",
+                "Гагарин летел в космос",
+                "Пушкин дописывал 'Евгения Онегина'",
+                "Суворов переходил Альпы"
             ],
             'facts': [
-                "В этот день в 1812 году началось Бородинское сражение",
-                "Ровно 100 лет назад люди ещё не знали про интернет",
-                "В XIX веке утренний кофе был настоящим ритуалом",
-                "Первый телефонный звонок состоялся в 1876 году",
-                "Древние римляне уже знали про центральное отопление"
+                "В 1812 году началось Бородинское сражение",
+                "Первый телефонный звонок был в 1876 году",
+                "Древние римляне знали про центральное отопление"
             ]
         }
     
-    def _get_random_historical(self) -> Dict:
-        """Получить случайные исторические данные"""
-        figure = random.choice(self.historical_data['figures'])
-        event = random.choice(self.historical_data['events'])
-        fact = random.choice(self.historical_data['facts'])
-        
+    def _get_random_history(self) -> Dict:
+        """Случайные исторические данные"""
         return {
-            'figure': figure['name'],
-            'quote': figure['quote'],
-            'event': event,
-            'fact': fact,
-            'era': figure['era']
+            'figure': random.choice(self.history['figures'])['name'],
+            'quote': random.choice(self.history['figures'])['quote'],
+            'event': random.choice(self.history['events']),
+            'fact': random.choice(self.history['facts'])
         }
     
-    async def generate_via_api(self, prompt: str, provider: Dict) -> str:
-        """Генерация через внешний API"""
+    async def generate_daily_post(self) -> str:
+        """Генерация ежедневного поста"""
+        history = self._get_random_history()
+        template = random.choice(self.templates['morning'])
+        
+        # Получаем праздники на сегодня
+        holiday = self._get_today_holiday()
+        
+        if holiday:
+            # Если есть праздник, добавляем его
+            holiday_template = random.choice(self.templates['holiday'])
+            holiday_text = holiday_template.format(
+                holiday=holiday,
+                parallel=f"Напоминает {history['event'].lower()}",
+                event=history['event']
+            )
+            main_text = template.format(**history)
+            return f"{main_text}\n\n{holiday_text}"
+        else:
+            # Обычный день
+            return template.format(**history)
+    
+    def _get_today_holiday(self) -> str:
+        """Получить праздник на сегодня"""
+        holidays = {
+            "01-01": "Новый год",
+            "01-07": "Рождество",
+            "01-14": "Старый Новый год",
+            "02-23": "День защитника Отечества",
+            "03-08": "Международный женский день",
+            "05-01": "Праздник весны и труда",
+            "05-09": "День Победы",
+            "06-12": "День России",
+            "11-04": "День народного единства",
+        }
+        
+        today = datetime.now().strftime("%m-%d")
+        return holidays.get(today, "")
+    
+    async def generate_with_api(self, prompt: str) -> str:
+        """Генерация через API (если доступно)"""
+        if not self.use_api:
+            return None
+        
         try:
-            async with aiohttp.ClientSession() as session:
-                if provider['name'] == 'OpenAI':
+            # OpenAI
+            if OPENAI_API_KEY:
+                async with aiohttp.ClientSession() as session:
                     data = {
-                        "model": provider['model'],
+                        "model": "gpt-3.5-turbo",
                         "messages": [
                             {"role": "system", "content": BOT_PERSONALITY},
                             {"role": "user", "content": prompt}
@@ -221,439 +339,367 @@ class TextGenerator:
                         "max_tokens": 150,
                         "temperature": 0.8
                     }
-                else:
+                    
+                    async with session.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                        json=data,
+                        timeout=10
+                    ) as response:
+                        
+                        if response.status == 200:
+                            result = await response.json()
+                            return result['choices'][0]['message']['content'].strip()
+            
+            # Hugging Face
+            elif HF_TOKEN:
+                async with aiohttp.ClientSession() as session:
                     data = {
                         "inputs": f"{BOT_PERSONALITY}\n\n{prompt}",
                         "parameters": {"max_length": 200, "temperature": 0.9}
                     }
-                
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with session.post(
-                    provider['url'],
-                    headers=provider['headers'],
-                    json=data,
-                    timeout=timeout
-                ) as response:
                     
-                    if response.status == 200:
-                        result = await response.json()
+                    async with session.post(
+                        "https://api-inference.huggingface.co/models/microsoft/phi-2",
+                        headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                        json=data,
+                        timeout=10
+                    ) as response:
                         
-                        if provider['name'] == 'OpenAI':
-                            text = result['choices'][0]['message']['content'].strip()
-                        else:
-                            text = result[0]['generated_text'].split('\n')[0].strip()
-                        
-                        return text[:500]
-                    
+                        if response.status == 200:
+                            result = await response.json()
+                            return result[0]['generated_text'].split('\n')[0].strip()
+        
         except Exception as e:
-            logger.warning(f"API {provider['name']} ошибка: {e}")
+            logger.warning(f"API ошибка: {e}")
         
         return None
-    
-    async def generate_template_text(self, template_type: str, **kwargs) -> str:
-        """Генерация по шаблону"""
-        templates = self.templates.get(template_type, self.templates['fallback'])
-        template = random.choice(templates)
-        
-        # Добавляем исторические данные
-        history = self._get_random_historical()
-        
-        # Заполняем шаблон
-        result = template.format(
-            **kwargs,
-            historical_figure=history['figure'],
-            historical_event=history['event'],
-            historical_fact=history['fact'],
-            quote=history['quote'],
-            historical_parallel=f"Напоминает {history['event'].lower()}",
-            historical_action=random.choice(["торжествовал", "размышлял", "сражался", "творил"])
-        )
-        
-        return result
-    
-    async def generate(self, context: Dict) -> str:
-        """
-        Основной метод генерации текста
-        context: {'type': 'birthday/holiday/daily', 'data': {...}}
-        """
-        cache_key = f"{context['type']}_{json.dumps(context['data'], sort_keys=True)}"
-        
-        # Проверяем кэш
-        if cache_key in self.cache:
-            logger.info("Используем кэшированный текст")
-            return self.cache[cache_key]
-        
-        text = None
-        
-        # Пытаемся использовать API
-        if self.use_api:
-            for provider in self.api_providers:
-                prompt = self._create_prompt(context)
-                text = await self.generate_via_api(prompt, provider)
-                if text:
-                    logger.info(f"Сгенерировано через {provider['name']}")
-                    break
-        
-        # Если API не сработало, используем шаблоны
-        if not text:
-            text = await self.generate_template_text(
-                context['type'],
-                **context['data']
-            )
-            logger.info("Сгенерировано по шаблону")
-        
-        # Кэшируем результат (на сутки)
-        self.cache[cache_key] = text
-        self._clean_cache()
-        
-        return text
-    
-    def _create_prompt(self, context: Dict) -> str:
-        """Создание промпта для API"""
-        if context['type'] == 'birthday':
-            return f"Сгенерируй ироничное поздравление с днём рождения для {context['data'].get('names', 'друга')}. Добавь историческую параллель. Текст должен быть коротким (1-2 предложения)."
-        elif context['type'] == 'holiday':
-            return f"Напиши короткий ироничный пост о празднике {context['data'].get('holiday', 'этом дне')} с исторической отсылкой."
-        else:
-            return f"Придумай короткое ироничное утреннее сообщение с исторической параллелью на сегодня."
-    
-    def _clean_cache(self):
-        """Очистка старого кэша (сохраняем только 100 записей)"""
-        if len(self.cache) > 100:
-            # Удаляем самые старые записи
-            keys = list(self.cache.keys())[:-50]
-            for key in keys:
-                del self.cache[key]
+
+# Инициализация генератора
+generator = TextGenerator()
 
 # ============================================================================
-# МЕНЕДЖЕР ПРАЗДНИКОВ И СОБЫТИЙ
+# ОСНОВНАЯ ЛОГИКА РАССЫЛКИ
 # ============================================================================
 
-class EventManager:
-    """Управление праздниками и событиями"""
+async def send_post_to_all_chats():
+    """Отправка поста во все активные чаты"""
     
-    def __init__(self):
-        self.holidays = self._load_default_holidays()
-        self.birthdays = self._load_default_birthdays()
-        self.sent_dates = set()
-        logger.info("Менеджер событий инициализирован")
-    
-    def _load_default_holidays(self) -> Dict:
-        """Загрузка праздников по умолчанию"""
-        return {
-            "01-01": "Новый год",
-            "01-07": "Рождество",
-            "01-14": "Старый Новый год",
-            "01-25": "День студента",
-            "02-23": "День защитника Отечества", 
-            "03-08": "Международный женский день",
-            "05-01": "Праздник весны и труда",
-            "05-09": "День Победы",
-            "06-01": "День защиты детей",
-            "06-12": "День России",
-            "11-04": "День народного единства",
-            "12-31": "Канун Нового года"
-        }
-    
-    def _load_default_birthdays(self) -> Dict:
-        """Загрузка дней рождения по умолчанию"""
-        return {
-            "01-15": ["Иван Грозный", "Арина Родионовна"],
-            "02-08": ["Жюль Верн", "Дмитрий Менделеев"],
-            "03-31": ["Рене Декарт"],
-            "04-15": ["Леонардо да Винчи"],
-            "05-24": ["Иосиф Бродский"],
-            "06-06": ["Александр Пушкин"],
-            "07-18": ["Уильям Теккерей"],
-            "08-19": ["Билл Клинтон"],
-            "09-08": ["Лев Толстой"],
-            "10-31": ["Иоганн Кеплер"],
-            "11-22": ["Шарль де Голль"],
-            "12-05": ["Уолт Дисней"]
-        }
-    
-    def get_today_events(self) -> Dict:
-        """Получить события на сегодня"""
-        today_key = datetime.now().strftime("%m-%d")
-        today_full = datetime.now().strftime("%Y-%m-%d")
-        
-        # Проверяем, не отправляли ли уже сегодня
-        if today_full in self.sent_dates:
-            return {'already_sent': True}
-        
-        events = {
-            'date': datetime.now().strftime("%d %B %Y"),
-            'holidays': [],
-            'birthdays': [],
-            'already_sent': False
-        }
-        
-        # Добавляем праздники
-        if today_key in self.holidays:
-            events['holidays'].append(self.holidays[today_key])
-        
-        # Добавляем дни рождения
-        if today_key in self.birthdays:
-            events['birthdays'].extend(self.birthdays[today_key])
-        
-        # Помечаем как отправленное
-        self.sent_dates.add(today_full)
-        
-        return events
-    
-    def add_birthday(self, date: str, names: List[str]):
-        """Добавить день рождения (для команд)"""
-        if date in self.birthdays:
-            self.birthdays[date].extend(names)
-        else:
-            self.birthdays[date] = names
-    
-    def clear_sent_dates(self):
-        """Очистить историю отправок (на случай перезапуска)"""
-        self.sent_dates.clear()
-
-# ============================================================================
-# ОСНОВНАЯ ЛОГИКА БОТА
-# ============================================================================
-
-# Инициализация компонентов
-text_generator = TextGenerator()
-event_manager = EventManager()
-
-async def generate_daily_post():
-    """Главная функция генерации ежедневного поста"""
-    
-    # Получаем московское время (UTC+3)
+    # Проверяем московское время (UTC+3)
     utc_now = datetime.utcnow()
     moscow_time = utc_now + timedelta(hours=3)
     
-    # Проверяем, 9:00 ли по Москве
+    # Только в 9:00 по Москве
     if moscow_time.hour != 9 or moscow_time.minute != 0:
-        return False
+        return
     
-    logger.info(f"=== Начинаем генерацию поста на {moscow_time.strftime('%d.%m.%Y %H:%M')} ===")
+    logger.info(f"🕘 {moscow_time.strftime('%H:%M')} МСК - начинаем рассылку")
     
-    # Получаем события дня
-    events = event_manager.get_today_events()
+    # Получаем все активные чаты
+    chats = db.get_all_active_chats()
+    if not chats:
+        logger.info("Нет активных чатов для рассылки")
+        return
     
-    if events.get('already_sent', False):
-        logger.info("Пост уже отправлен сегодня")
-        return False
+    logger.info(f"Найдено {len(chats)} активных чатов")
     
-    # Определяем тип контекста
-    if events['birthdays']:
-        context_type = 'birthday'
-        context_data = {'names': ', '.join(events['birthdays'])}
-    elif events['holidays']:
-        context_type = 'holiday'
-        context_data = {'holiday': ', '.join(events['holidays'])}
-    else:
-        context_type = 'daily'
-        context_data = {}
+    # Генерируем пост один раз для всех чатов
+    post_text = await generate_daily_post()
     
-    context = {
-        'type': context_type,
-        'data': context_data
-    }
+    if not post_text:
+        logger.error("Не удалось сгенерировать пост")
+        return
     
-    # Генерируем текст
-    try:
-        generated_text = await text_generator.generate(context)
+    # Форматируем пост
+    formatted_post = f"📜 *{BOT_NAME}* 📜\n\n{post_text}\n\n_{moscow_time.strftime('%d.%m.%Y')}_\n#история #цитатадня"
+    
+    # Отправляем во все чаты
+    success_count = 0
+    fail_count = 0
+    
+    for chat in chats:
+        chat_id = chat['chat_id']
+        chat_title = chat['chat_title']
         
-        # Формируем финальный пост
-        post = f"📜 *{BOT_NAME.upper()}* 📜\n\n"
-        post += f"{generated_text}\n\n"
+        # Проверяем, не отправляли ли уже сегодня
+        if db.was_post_sent_today(chat_id):
+            logger.info(f"↪️ Пропускаем {chat_title} - уже отправляли сегодня")
+            continue
         
-        # Добавляем информацию о событиях
-        if events['birthdays']:
-            post += f"🎂 Дни рождения: {', '.join(events['birthdays'])}\n"
-        if events['holidays']:
-            post += f"🎉 Праздник: {', '.join(events['holidays'])}\n"
-        
-        post += f"\n_{events['date']}_\n"
-        post += "#история #цитатадня #историческиепараллели"
-        
-        # Отправляем пост
-        if not TEST_MODE:
+        try:
+            # Пытаемся отправить
             await bot.send_message(
-                chat_id=GROUP_ID,
-                text=post,
+                chat_id=chat_id,
+                text=formatted_post,
                 parse_mode="Markdown",
                 disable_notification=False
             )
-            logger.info(f"Пост отправлен в группу {GROUP_ID}")
-        else:
-            # Тестовый вывод
-            print("\n" + "="*50)
-            print("ТЕСТОВЫЙ ПОСТ (не отправлен):")
-            print(post)
-            print("="*50 + "\n")
-            logger.info("Пост сгенерирован (тестовый режим)")
+            
+            # Помечаем как отправленное
+            db.mark_post_sent(chat_id, moscow_time.strftime('%Y-%m-%d'))
+            
+            logger.info(f"✅ Отправлено в: {chat_title} (ID: {chat_id})")
+            success_count += 1
+            
+            # Небольшая пауза между отправками
+            await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Анализируем ошибку
+            if "chat not found" in error_msg or "bot was kicked" in error_msg:
+                logger.warning(f"🗑️ Удаляем чат {chat_title} - бота исключили")
+                db.remove_chat(chat_id)
+            elif "not enough rights" in error_msg:
+                logger.warning(f"⚠️ Нет прав в чате {chat_title}")
+            elif "Too Many Requests" in error_msg:
+                logger.warning(f"⏳ Лимит запросов, ждем...")
+                await asyncio.sleep(5)
+            else:
+                logger.error(f"❌ Ошибка отправки в {chat_title}: {e}")
+            
+            fail_count += 1
+    
+    # Итоги рассылки
+    logger.info(f"📊 Итоги рассылки: {success_count} успешно, {fail_count} ошибок")
+    
+    # Очистка старых записей раз в неделю
+    if moscow_time.weekday() == 0:  # Понедельник
+        db.clear_old_records()
+        logger.info("🧹 Выполнена очистка старых записей")
+
+async def generate_daily_post() -> str:
+    """Генерация поста с приоритетом API"""
+    
+    # Пытаемся использовать API
+    if generator.use_api:
+        api_prompt = "Напиши короткий ироничный исторический пост на утро. 1-2 предложения."
+        api_text = await generator.generate_with_api(api_prompt)
         
-        return True
-        
-    except Exception as e:
-        logger.error(f"Ошибка при генерации поста: {e}", exc_info=True)
-        return False
+        if api_text:
+            return api_text
+    
+    # Используем шаблоны как запасной вариант
+    return await generator.generate_daily_post()
 
 # ============================================================================
 # КОМАНДЫ БОТА
 # ============================================================================
 
-@dp.message_handler(commands=['start', 'help'])
+@dp.message_handler(Command('start', 'help'))
 async def cmd_start(message: types.Message):
-    """Справка по командам"""
-    help_text = f"""
+    """Приветственное сообщение"""
+    welcome_text = f"""
 🤖 *{BOT_NAME}*
 
-Я автоматически генерирую исторические посты каждый день в 9:00 по Москве!
+Привет! Я бот, который каждый день в 9:00 по Москве присылаю интересные исторические посты с ироничным взглядом.
+
+*Как использовать:*
+1. Добавьте меня в группу или канал
+2. Дайте права на отправку сообщений
+3. Я автоматически начну отправлять ежедневные посты!
 
 *Доступные команды:*
 /start или /help - это сообщение
-/test - тестовая генерация поста
-/status - статус бота
-/today - события сегодняшнего дня
-/simulate - симулировать генерацию (только для админов)
-/add_birthday - добавить день рождения (формат: 01-15 Иван)
-/clear_cache - очистить кэш генератора
+/chats - список всех чатов, где я работаю
+/test - тестовая отправка поста
+/stop - остановить рассылку в этом чате
+/stats - статистика бота
+/post_now - отправить пост прямо сейчас (только для админов)
+/settings - настройки (в разработке)
 
-*Настройки в BotHost:*
-TELEGRAM_TOKEN - токен бота
-GROUP_ID - ID группы/канала
-OPENAI_API_KEY - ключ OpenAI (опционально)
-HF_TOKEN - токен HuggingFace (опционально)
+Добавляйте меня в чаты и наслаждайтесь историческими открытиями! 📜
 """
-    await message.answer(help_text, parse_mode="Markdown")
+    await message.answer(welcome_text, parse_mode="Markdown")
 
-@dp.message_handler(commands=['test'])
+@dp.message_handler(Command('chats'))
+async def cmd_chats(message: types.Message):
+    """Показать все чаты"""
+    chats = db.get_all_active_chats()
+    
+    if not chats:
+        await message.answer("📭 Я ещё не добавлен ни в один чат.")
+        return
+    
+    response = f"📋 *Чаты, где я работаю:* ({len(chats)})\n\n"
+    
+    for i, chat in enumerate(chats[:20], 1):  # Ограничиваем 20 чатами
+        last_post = chat['last_post_date']
+        if last_post:
+            last_post = datetime.fromisoformat(last_post).strftime('%d.%m.%Y')
+        else:
+            last_post = "ещё не было"
+        
+        response += f"{i}. {chat['chat_title']}\n"
+        response += f"   ID: `{chat['chat_id']}`\n"
+        response += f"   Последний пост: {last_post}\n\n"
+    
+    if len(chats) > 20:
+        response += f"\n... и ещё {len(chats) - 20} чатов"
+    
+    await message.answer(response, parse_mode="Markdown")
+
+@dp.message_handler(Command('test'))
 async def cmd_test(message: types.Message):
-    """Тестовая генерация"""
+    """Тестовая отправка поста в этот чат"""
+    if message.chat.type == 'private':
+        await message.answer("Эта команда работает только в группах и каналах!")
+        return
+    
     await message.answer("🧪 Генерирую тестовый пост...")
     
-    test_context = {
-        'type': 'birthday',
-        'data': {'names': 'Тестовый Пользователь'}
-    }
+    post_text = await generate_daily_post()
+    formatted_post = f"📜 *Тестовый пост от {BOT_NAME}* 📜\n\n{post_text}\n\n#тест"
     
     try:
-        text = await text_generator.generate(test_context)
-        await message.answer(f"📜 *Тестовый пост:*\n\n{text}", parse_mode="Markdown")
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=formatted_post,
+            parse_mode="Markdown"
+        )
+        await message.answer("✅ Тестовый пост отправлен!")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-@dp.message_handler(commands=['status'])
-async def cmd_status(message: types.Message):
-    """Статус бота"""
+@dp.message_handler(Command('stop'))
+async def cmd_stop(message: types.Message):
+    """Остановить рассылку в этом чате"""
+    if message.chat.type == 'private':
+        await message.answer("Эта команда работает только в группах и каналах!")
+        return
+    
+    db.remove_chat(message.chat.id)
+    await message.answer(
+        "✅ Рассылка остановлена в этом чате.\n"
+        "Чтобы возобновить, просто напишите /start"
+    )
+
+@dp.message_handler(Command('stats'))
+async def cmd_stats(message: types.Message):
+    """Статистика бота"""
+    chat_count = db.get_chat_count()
     utc_now = datetime.utcnow()
     moscow_time = utc_now + timedelta(hours=3)
     
-    status_text = f"""
-📊 *Статус {BOT_NAME}*
+    stats_text = f"""
+📊 *Статистика {BOT_NAME}*
 
-*Время:*
-• UTC: {utc_now.strftime('%H:%M:%S')}
-• Москва: {moscow_time.strftime('%H:%M:%S')}
+*Общее:*
+• Активных чатов: {chat_count}
+• Время (МСК): {moscow_time.strftime('%H:%M:%S')}
 • Дата: {moscow_time.strftime('%d.%m.%Y')}
+• Режим генерации: {'API' if generator.use_api else 'Шаблоны'}
 
-*Режим работы:*
-• Режим: {'ТЕСТОВЫЙ' if TEST_MODE else 'РАБОЧИЙ'}
-• Группа: {f'ID {GROUP_ID}' if not TEST_MODE else 'не указана'}
-• API доступно: {'Да' if text_generator.use_api else 'Нет'}
+*Ближайшая рассылка:*
+• Ежедневно в 9:00 по Москве
+• Следующая через: {_next_post_in(moscow_time)}
 
-*Статистика:*
-• Размер кэша: {len(text_generator.cache)}
-• Событий в базе: {len(event_manager.holidays)} праздников, {len(event_manager.birthdays)} ДР
-
-*Следующий пост:* 9:00 МСК
+*Команды управления:*
+/chats - список чатов
+/test - тест в этом чате  
+/stop - остановить здесь
+/post_now - срочный пост (админы)
 """
-    await message.answer(status_text, parse_mode="Markdown")
-
-@dp.message_handler(commands=['today'])
-async def cmd_today(message: types.Message):
-    """События сегодня"""
-    events = event_manager.get_today_events()
     
-    today_text = f"""
-📅 *События на сегодня*
+    await message.answer(stats_text, parse_mode="Markdown")
 
-*Дата:* {events['date']}
-
-*Праздники:*
-{chr(10).join(f'• {h}' for h in events['holidays']) if events['holidays'] else '• Нет праздников'}
-
-*Дни рождения:*
-{chr(10).join(f'• {b}' for b in events['birthdays']) if events['birthdays'] else '• Нет дней рождения'}
-
-*Статус:* {'Пост уже отправлен' if events.get('already_sent') else 'Ожидается отправка в 9:00'}
-"""
-    await message.answer(today_text, parse_mode="Markdown")
-
-@dp.message_handler(commands=['simulate'])
-async def cmd_simulate(message: types.Message):
-    """Симуляция генерации (только для админа)"""
-    # Простая проверка на админа (можно улучшить)
-    if message.from_user.id != message.chat.id:  # Только в личке
-        await message.answer("Эта команда только в личных сообщениях")
-        return
+def _next_post_in(moscow_time: datetime) -> str:
+    """Время до следующей рассылки"""
+    next_post = moscow_time.replace(hour=9, minute=0, second=0, microsecond=0)
     
-    await message.answer("🎭 Симулирую генерацию поста...")
-    success = await generate_daily_post()
+    if moscow_time >= next_post:
+        next_post += timedelta(days=1)
     
-    if success:
-        await message.answer("✅ Генерация завершена успешно!")
-    else:
-        await message.answer("❌ Генерация не выполнена (возможно, не время или уже отправляли)")
+    delta = next_post - moscow_time
+    hours = delta.seconds // 3600
+    minutes = (delta.seconds % 3600) // 60
+    
+    return f"{hours}ч {minutes}м"
 
-@dp.message_handler(commands=['clear_cache'])
-async def cmd_clear_cache(message: types.Message):
-    """Очистка кэша"""
-    text_generator.cache.clear()
-    event_manager.clear_sent_dates()
-    await message.answer("✅ Кэш очищен!")
+@dp.message_handler(Command('post_now'))
+async def cmd_post_now(message: types.Message):
+    """Отправить пост прямо сейчас (для админов)"""
+    # Проверка на админа (можно настроить список ID)
+    admin_ids = os.environ.get('ADMIN_IDS', '').split(',')
+    admin_ids = [int(id.strip()) for id in admin_ids if id.strip()]
+    
+    if message.from_user.id not in admin_ids and not admin_ids:
+        # Если не админ, проверяем что команда в личке
+        if message.chat.type != 'private':
+            await message.answer("Эта команда только для администраторов.")
+            return
+    
+    await message.answer("🚀 Отправляю пост во все чаты...")
+    
+    # Запускаем рассылку
+    await send_post_to_all_chats()
+    
+    await message.answer("✅ Рассылка завершена!")
 
-@dp.message_handler(commands=['add_birthday'])
-async def cmd_add_birthday(message: types.Message):
-    """Добавить день рождения"""
-    args = message.get_args().strip()
+@dp.message_handler(content_types=['new_chat_members'])
+async def on_new_chat_members(message: types.Message):
+    """Когда бота добавляют в чат"""
+    new_members = message.new_chat_members
     
-    if not args:
-        await message.answer(
-            "Формат: /add_birthday ММ-ДД Имя\n"
-            "Пример: /add_birthday 01-15 Иван Иванов\n\n"
-            "Текущие дни рождения:\n" +
-            "\n".join([f"{date}: {', '.join(names)}" 
-                      for date, names in event_manager.birthdays.items()])
-        )
-        return
+    for member in new_members:
+        if member.id == bot.id:
+            # Бота добавили в чат
+            chat_title = message.chat.title or f"Чат {message.chat.id}"
+            
+            # Добавляем чат в базу
+            db.add_chat(
+                chat_id=message.chat.id,
+                chat_title=chat_title,
+                chat_type=message.chat.type
+            )
+            
+            # Приветственное сообщение
+            welcome_msg = (
+                f"📜 *{BOT_NAME} добавлен в чат!* 📜\n\n"
+                f"Приветствую, {chat_title}! 🎉\n\n"
+                f"Я буду присылать исторические посты каждый день в 9:00 по Москве.\n\n"
+                f"*Команды в этом чате:*\n"
+                f"/test - тестовый пост\n"
+                f"/stop - остановить рассылку\n\n"
+                f"До завтрашнего утра! ✨"
+            )
+            
+            try:
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=welcome_msg,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить приветствие: {e}")
+
+@dp.message_handler(content_types=['left_chat_member'])
+async def on_left_chat_member(message: types.Message):
+    """Когда бота исключают из чата"""
+    left_member = message.left_chat_member
     
-    try:
-        parts = args.split(' ', 1)
-        if len(parts) != 2:
-            raise ValueError
-        
-        date_str, name = parts
-        event_manager.add_birthday(date_str, [name])
-        
-        await message.answer(f"✅ Добавлен день рождения: {date_str} - {name}")
-    except:
-        await message.answer("❌ Неверный формат. Используйте: ММ-ДД Имя")
+    if left_member.id == bot.id:
+        # Бота исключили из чата
+        db.remove_chat(message.chat.id)
+        logger.info(f"Бота исключили из чата {message.chat.id}")
 
 # ============================================================================
 # ФОНОВЫЙ ПЛАНИРОВЩИК
 # ============================================================================
 
 async def background_scheduler():
-    """Фоновая задача для планировщика"""
-    logger.info("Фоновый планировщик запущен")
+    """Фоновый планировщик для рассылки"""
+    logger.info("⏰ Планировщик запущен")
     
     while True:
         try:
-            await generate_daily_post()
+            await send_post_to_all_chats()
             await asyncio.sleep(55)  # Проверяем каждые 55 секунд
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Ошибка в планировщике: {e}")
+            logger.error(f"Ошибка планировщика: {e}")
             await asyncio.sleep(60)
 
 # ============================================================================
@@ -663,27 +709,13 @@ async def background_scheduler():
 async def on_startup(_):
     """Действия при запуске"""
     logger.info("=" * 50)
-    logger.info(f"{BOT_NAME} запускается...")
-    logger.info(f"Режим: {'ТЕСТОВЫЙ' if TEST_MODE else 'РАБОЧИЙ'}")
-    logger.info(f"Версия: 2.0 (без .env файла)")
-    logger.info(f"Время UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"🚀 {BOT_NAME} запускается...")
+    logger.info(f"📊 Активных чатов: {db.get_chat_count()}")
+    logger.info(f"⚙️ Режим генерации: {'API' if generator.use_api else 'Шаблоны'}")
     logger.info("=" * 50)
     
-    # Запускаем фоновый планировщик
+    # Запускаем планировщик
     asyncio.create_task(background_scheduler())
-    
-    # Приветственное сообщение
-    if not TEST_MODE:
-        try:
-            await bot.send_message(
-                GROUP_ID,
-                f"📜 *{BOT_NAME} активирован!* 📜\n\n"
-                f"Завтра в 9:00 ждите первый иронично-исторический пост!\n\n"
-                f"#запуск #история #бот",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось отправить приветствие: {e}")
 
 async def on_shutdown(_):
     """Действия при остановке"""
@@ -691,11 +723,11 @@ async def on_shutdown(_):
     await bot.close()
 
 # ============================================================================
-# ТОЧКА ВХОДА ДЛЯ BOTHOST
+# ТОЧКА ВХОДА
 # ============================================================================
 
 if __name__ == '__main__':
-    logger.info("Запуск бота...")
+    logger.info("Запуск универсального бота...")
     
     try:
         executor.start_polling(
@@ -710,5 +742,3 @@ if __name__ == '__main__':
         logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}", exc_info=True)
-        print(f"\n❌ Критическая ошибка: {e}")
-        print("Проверьте переменные окружения в BotHost!")
