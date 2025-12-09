@@ -26,7 +26,7 @@ from aiogram.dispatcher.filters import Command
 # ============================================================================
 
 # Токен бота из переменных окружения BotHost
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+TELEGRAM_TOKEN = '8512003379:AAFPI9Y5nRG9RpQ4jt1S_3HPa8dPAgppM_M'
 if not TELEGRAM_TOKEN:
     print("❌ ОШИБКА: Установите TELEGRAM_TOKEN в настройках BotHost!")
     exit(1)
@@ -742,3 +742,4 @@ if __name__ == '__main__':
         logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}", exc_info=True)
+
